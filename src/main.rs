@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io::Cursor,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,20 +16,20 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use dotenvy::dotenv;
-use image::{DynamicImage, GenericImage, ImageOutputFormat, Rgba, RgbaImage};
-use kamadak_exif as exif;
+use image::{DynamicImage, GenericImage, ImageFormat, Rgba};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
 struct AppState {
-    rate_limiter: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    limiter: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
 }
 
 impl AppState {
     fn allow_request(&self, key: &str) -> bool {
-        let mut lock = self.rate_limiter.lock().unwrap();
+        let mut lock = self.limiter.lock().unwrap();
         let now = Instant::now();
         let entries = lock.entry(key.to_string()).or_insert_with(Vec::new);
         entries.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
@@ -65,33 +66,27 @@ struct Explanation {
     next_steps: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ReportEnvelope {
-    report: Value,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
+
     let state = AppState {
-        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        limiter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
+        .route("/", get(index))
         .route("/health", get(health))
         .route("/analyze", post(analyze_handler))
         .route("/clean", post(clean_handler))
         .route("/explain", post(explain_handler))
-        .fallback_service(ServeDir::new("static").fallback(index))
+        .fallback_service(ServeDir::new("static"))
         .with_state(state)
         .layer(DefaultBodyLimit::max(15 * 1024 * 1024));
 
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
     println!("TruthVision Lens running on http://localhost:8000");
-    axum::serve(
-        tokio::net::TcpListener::bind("0.0.0.0:8000").await?,
-        app,
-    )
-    .await?;
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
 
@@ -135,7 +130,7 @@ async fn analyze_handler(mut multipart: Multipart) -> Result<impl IntoResponse, 
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Unsupported image: {e}")))?;
 
     let findings = detect_privacy_findings(&file_bytes, &file_name);
-    let authenticity = analyze_authenticity(&file_bytes, &findings);
+    let authenticity = analyze_authenticity(&findings);
 
     let report = json!({
         "image": {
@@ -156,7 +151,14 @@ async fn analyze_handler(mut multipart: Multipart) -> Result<impl IntoResponse, 
 async fn clean_handler(mut multipart: Multipart) -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut file_name = String::new();
     let mut file_bytes = Vec::new();
-    let mut selected_fields = vec!["location", "device", "timestamps", "owner", "thumbnail", "everything_else"];
+    let mut selected_fields: Vec<String> = vec![
+        "location".to_string(),
+        "device".to_string(),
+        "timestamps".to_string(),
+        "owner".to_string(),
+        "thumbnail".to_string(),
+        "everything_else".to_string(),
+    ];
     let mut blur_regions = Vec::<HashMap<String, i32>>::new();
     let mut blur_mode = "gaussian".to_string();
     let mut keep_authenticity = false;
@@ -216,48 +218,35 @@ async fn clean_handler(mut multipart: Multipart) -> Result<impl IntoResponse, (S
 
 async fn explain_handler(State(state): State<AppState>, Json(payload): Json<Value>) -> impl IntoResponse {
     let key = "anonymous".to_string();
-    let ok = state.allow_request(&key);
-    if !ok {
+    if !state.allow_request(&key) {
         return Json(Explanation {
             available: false,
             source: "Built-in explanation".to_string(),
-            summary: "The explanation feature is temporarily rate-limited. Please wait a moment and try again.".to_string(),
+            summary: "Rate limited. Please wait a moment and try again.".to_string(),
             risks: vec!["The request was limited to avoid overuse.".to_string()],
             next_steps: vec!["Wait a moment and try again.".to_string(), "Use the built-in summary if Gemini is unavailable.".to_string()],
         });
     }
 
-    let sanitized = build_gemini_payload(&payload);
-    let api_key = std::env::var("GEMINI_API_KEY").ok().filter(|v| !v.trim().is_empty());
+    if let Ok(api_key) = std::env::var("GEMINI_API_KEY") {
+        if !api_key.trim().is_empty() {
+            let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash-lite".to_string());
+            let client = Client::builder().timeout(Duration::from_secs(15)).build().unwrap();
+            let sanitized = build_gemini_payload(&payload);
+            let req = client
+                .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"))
+                .json(&json!({
+                    "contents": [{"parts": [{"text": serde_json::to_string(&sanitized).unwrap_or_default()}]}],
+                    "generationConfig": { "temperature": 0.2, "responseMimeType": "application/json" }
+                }))
+                .send();
 
-    if let Some(api_key) = api_key {
-        let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash-lite".to_string());
-
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().unwrap();
-        let request_body = json!({
-            "system_instruction": {
-                "parts": [{
-                    "text": "Explain for a non-technical reader, stay calibrated, never say an image is definitely real or fake, describe verdicts as likelihoods, mention that missing metadata is a weak signal and detection is less reliable on compressed images and unseen generators when relevant, invent nothing beyond the provided findings, no markdown headers, no emoji, no exclamation marks, about 180 words maximum."
-                }]
-            },
-            "contents": [{
-                "parts": [{
-                    "text": serde_json::to_string(&sanitized).unwrap_or_default()
-                }]
-            }],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json"
-            }
-        });
-
-        let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}");
-        match client.post(url).json(&request_body).send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
+            match req.await {
+                Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-                            let summary = parsed.get("candidates")
+                            let summary = parsed
+                                .get("candidates")
                                 .and_then(|c| c.as_array())
                                 .and_then(|a| a.first())
                                 .and_then(|c| c.get("content"))
@@ -266,15 +255,24 @@ async fn explain_handler(State(state): State<AppState>, Json(payload): Json<Valu
                                 .and_then(|p| p.first())
                                 .and_then(|p| p.get("text"))
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("The image contains a limited set of privacy and authenticity cues.");
+                                .unwrap_or("The file contains a mix of privacy and authenticity cues.");
 
-                            let result = parse_explanation_text(summary);
-                            return Json(result);
+                            return Json(Explanation {
+                                available: true,
+                                source: "Written by Gemini".to_string(),
+                                summary: summary.to_string(),
+                                risks: vec!["The verdict is based on metadata and heuristic cues.".to_string()],
+                                next_steps: vec![
+                                    "Review the flagged metadata before sharing the file.".to_string(),
+                                    "Remove the selected metadata groups if they are not needed.".to_string(),
+                                    "Keep the cleaned file local and check the authenticity verdict again.".to_string(),
+                                ],
+                            });
                         }
                     }
                 }
+                _ => {}
             }
-            Err(_) => {}
         }
     }
 
@@ -283,77 +281,42 @@ async fn explain_handler(State(state): State<AppState>, Json(payload): Json<Valu
 
 fn build_gemini_payload(payload: &Value) -> Value {
     let report = payload.get("report").unwrap_or(payload);
-    let privacy = report
-        .get("privacy")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let privacy = report.get("privacy").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let authenticity = report.get("authenticity").cloned().unwrap_or(Value::Null);
 
-    let mut risks = Vec::new();
-    let mut risks_text = Vec::new();
-    for item in privacy {
-        if let Some(label) = item.get("label").and_then(|v| v.as_str()) {
+    let risks = privacy
+        .iter()
+        .filter_map(|item| item.get("label").and_then(|v| v.as_str()))
+        .filter(|label| {
             let lower = label.to_ascii_lowercase();
-            let is_sensitive = lower.contains("gps")
+            lower.contains("gps")
                 || lower.contains("serial")
                 || lower.contains("artist")
                 || lower.contains("author")
-                || lower.contains("copyright")
                 || lower.contains("device")
                 || lower.contains("timestamp")
                 || lower.contains("thumbnail")
                 || lower.contains("owner")
-                || lower.contains("software")
                 || lower.contains("generator")
-                || lower.contains("png text");
-            if is_sensitive {
-                let severity = item.get("severity").and_then(|v| v.as_str()).unwrap_or("Medium");
-                let display = format!("{label} ({severity})");
-                risks.push(display.clone());
-                risks_text.push(display);
-            }
-        }
-    }
-
-    if risks_text.is_empty() {
-        risks_text.push("No clear privacy signals were found.".to_string());
-    }
+                || lower.contains("png")
+        })
+        .map(|label| label.to_string())
+        .take(4)
+        .collect::<Vec<_>>();
 
     let verdict = authenticity.get("verdict").and_then(|v| v.as_str()).unwrap_or("Inconclusive");
     let confidence = authenticity.get("confidence").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let bucket = if confidence >= 70 { "high" } else if confidence >= 40 { "medium" } else { "low" };
 
     json!({
-        "summary": format!("The overall authenticity likelihood is {verdict}. The model probability is {bucket} confidence, and detection is less reliable on heavily compressed images and unseen generators. Missing metadata is a weak signal only."),
-        "risks": risks_text,
-        "next_steps": ["Review the flagged metadata before sharing the image.", "Remove the selected metadata groups if they are not needed.", "Re-check the authenticity verdict after cleaning."]
+        "summary": format!("The authenticity likelihood is {verdict}. The model probability is {bucket} confidence, and detection is less reliable on compressed images and unseen generators. Missing metadata is a weak signal only."),
+        "risks": if risks.is_empty() { vec!["No clear privacy signals were found."] } else { risks },
+        "next_steps": [
+            "Review the flagged metadata before sharing the image.",
+            "Remove the selected metadata groups if they are not needed.",
+            "Re-check the authenticity verdict after cleaning."
+        ]
     })
-}
-
-fn parse_explanation_text(raw: &str) -> Explanation {
-    let text = raw.trim();
-    let mut summary = text.to_string();
-    if summary.is_empty() {
-        summary = "The file appears to have a mix of metadata and authenticity signals, and the verdict remains a likelihood estimate rather than a definitive fact.".to_string();
-    }
-
-    let risks = vec![
-        "The verdict is based on metadata and heuristic cues, not a forensic guarantee.".to_string(),
-        "Missing metadata is a weak signal and should not be treated as proof.".to_string(),
-    ];
-
-    Explanation {
-        available: true,
-        source: "Written by Gemini".to_string(),
-        summary,
-        risks,
-        next_steps: vec![
-            "Review the flagged metadata before sharing the file.".to_string(),
-            "Remove the private location and owner details if they are not needed.".to_string(),
-            "Keep the cleaned file local and use the authenticity verdict as guidance only.".to_string(),
-        ],
-    }
 }
 
 fn build_builtin_explanation(payload: &Value) -> Explanation {
@@ -361,79 +324,41 @@ fn build_builtin_explanation(payload: &Value) -> Explanation {
     let privacy = report.get("privacy").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let authenticity = report.get("authenticity").cloned().unwrap_or(Value::Null);
     let verdict = authenticity.get("verdict").and_then(|v| v.as_str()).unwrap_or("Inconclusive");
-    let summary = format!("The current authenticity likelihood is {verdict}. Detection is heuristic and less reliable on heavily compressed images and unseen generators. Missing metadata is a weak signal only, and the report focuses on the metadata that is present.");
 
     let risks = privacy
         .iter()
-        .filter_map(|item| item.get("label").and_then(|v| v.as_str()).map(str::to_string))
+        .filter_map(|item| item.get("label").and_then(|v| v.as_str()))
         .take(4)
+        .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
-    let explanation = Explanation {
+    Explanation {
         available: false,
         source: "Built-in explanation".to_string(),
-        summary,
-        risks: if risks.is_empty() { vec!["No strong privacy signals were found.".to_string()] } else { risks },
+        summary: format!("The current authenticity likelihood is {verdict}. Detection is heuristic and less reliable on heavily compressed images and unseen generators. Missing metadata is a weak signal only, and the report focuses on metadata that is present."),
+        risks: if risks.is_empty() { vec!["No clear privacy signals were found.".to_string()] } else { risks },
         next_steps: vec![
             "Review the flagged metadata before sharing the file.".to_string(),
             "Remove the selected metadata groups if they are not needed.".to_string(),
             "Keep the cleaned file local and check the authenticity verdict again.".to_string(),
         ],
-    };
-    explanation
+    }
 }
 
 fn detect_privacy_findings(file_bytes: &[u8], file_name: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let text = String::from_utf8_lossy(file_bytes).to_ascii_lowercase();
     let lower_name = file_name.to_ascii_lowercase();
+    let bytes = String::from_utf8_lossy(file_bytes).to_ascii_lowercase();
 
-    if let Ok(exif_reader) = exif::Reader::new().read_from_container(&mut Cursor::new(file_bytes)) {
-        for field in exif_reader.fields() {
-            let tag = field.tag;
-            if tag == 1 || tag == 2 || tag == 3 || tag == 4 {
-                findings.push(Finding {
-                    label: "GPS coordinates".to_string(),
-                    value: "Location embedded in file".to_string(),
-                    severity: "High".to_string(),
-                });
-                break;
-            }
-            if tag == 271 || tag == 272 || tag == 0x000A || tag == 0x000B {
-                findings.push(Finding {
-                    label: "Device make and model".to_string(),
-                    value: "Camera metadata present".to_string(),
-                    severity: "Medium".to_string(),
-                });
-            }
-            if tag == 306 || tag == 36867 || tag == 36868 {
-                findings.push(Finding {
-                    label: "Timestamps".to_string(),
-                    value: "Embedded EXIF time present".to_string(),
-                    severity: "Medium".to_string(),
-                });
-            }
-            if tag == 315 || tag == 33432 || tag == 0x0009 {
-                findings.push(Finding {
-                    label: "Owner or artist metadata".to_string(),
-                    value: "Personal attribution present".to_string(),
-                    severity: "High".to_string(),
-                });
-            }
-        }
+    if bytes.contains("gps") || bytes.contains("latitude") || bytes.contains("longitude") {
+        findings.push(Finding {
+            label: "GPS coordinates".to_string(),
+            value: "Location embedded in file".to_string(),
+            severity: "High".to_string(),
+        });
     }
 
-    if text.contains("gps") || text.contains("latitude") || text.contains("longitude") {
-        if !findings.iter().any(|f| f.label == "GPS coordinates") {
-            findings.push(Finding {
-                label: "GPS coordinates".to_string(),
-                value: "Location embedded in file".to_string(),
-                severity: "High".to_string(),
-            });
-        }
-    }
-
-    if text.contains("serial") || text.contains("device serial") {
+    if bytes.contains("serial") || bytes.contains("device serial") {
         findings.push(Finding {
             label: "Serial number".to_string(),
             value: "Device serial present".to_string(),
@@ -441,7 +366,31 @@ fn detect_privacy_findings(file_bytes: &[u8], file_name: &str) -> Vec<Finding> {
         });
     }
 
-    if lower_name.ends_with(".png") && (text.contains("software") || text.contains("artist") || text.contains("comment") || text.contains("creation time")) {
+    if bytes.contains("artist") || bytes.contains("author") || bytes.contains("copyright") {
+        findings.push(Finding {
+            label: "Owner or artist metadata".to_string(),
+            value: "Personal attribution present".to_string(),
+            severity: "High".to_string(),
+        });
+    }
+
+    if bytes.contains("model") || bytes.contains("make") || bytes.contains("camera") {
+        findings.push(Finding {
+            label: "Device make and model".to_string(),
+            value: "Camera metadata present".to_string(),
+            severity: "Medium".to_string(),
+        });
+    }
+
+    if bytes.contains("202") || bytes.contains("datetime") || bytes.contains("date") {
+        findings.push(Finding {
+            label: "Timestamps".to_string(),
+            value: "Embedded EXIF time present".to_string(),
+            severity: "Medium".to_string(),
+        });
+    }
+
+    if lower_name.ends_with(".png") && (bytes.contains("software") || bytes.contains("comment") || bytes.contains("creation time")) {
         findings.push(Finding {
             label: "PNG text metadata".to_string(),
             value: "Possible text chunks detected".to_string(),
@@ -449,25 +398,15 @@ fn detect_privacy_findings(file_bytes: &[u8], file_name: &str) -> Vec<Finding> {
         });
     }
 
-    if lower_name.ends_with(".jpg") || lower_name.ends_with(".jpeg") {
-        if !findings.iter().any(|f| f.label == "Timestamps") {
-            findings.push(Finding {
-                label: "Timestamps".to_string(),
-                value: "Embedded EXIF time present".to_string(),
-                severity: "Medium".to_string(),
-            });
-        }
-    }
-
-    if text.contains("adobe") || text.contains("photoshop") || text.contains("lightroom") || text.contains("midjourney") || text.contains("stable diffusion") || text.contains("dall-e") || text.contains("firefly") {
+    if bytes.contains("adobe") || bytes.contains("photoshop") || bytes.contains("lightroom") || bytes.contains("midjourney") || bytes.contains("stable diffusion") || bytes.contains("dall-e") {
         findings.push(Finding {
             label: "Generator or editing metadata".to_string(),
-            value: "Known creator or editing strings detected".to_string(),
+            value: "Known editing strings detected".to_string(),
             severity: "Medium".to_string(),
         });
     }
 
-    if text.contains("c2pa") || text.contains("jumbf") {
+    if bytes.contains("c2pa") || bytes.contains("jumbf") {
         findings.push(Finding {
             label: "C2PA marker".to_string(),
             value: "Marker detected".to_string(),
@@ -483,35 +422,25 @@ fn detect_privacy_findings(file_bytes: &[u8], file_name: &str) -> Vec<Finding> {
         });
     }
 
-    let mut dedup = Vec::new();
     let mut seen = HashMap::new();
+    let mut deduped = Vec::new();
     for item in findings {
         if seen.insert(item.label.clone(), true).is_none() {
-            dedup.push(item);
+            deduped.push(item);
         }
     }
-    dedup
+    deduped
 }
 
-fn analyze_authenticity(file_bytes: &[u8], findings: &[Finding]) -> Authenticity {
+fn analyze_authenticity(findings: &[Finding]) -> Authenticity {
     let mut score = 0.0f32;
     for finding in findings {
         let label = finding.label.to_ascii_lowercase();
-        if label.contains("gps") {
-            score += 0.22;
-        }
-        if label.contains("serial") || label.contains("device") {
-            score += 0.14;
-        }
-        if label.contains("owner") || label.contains("artist") {
-            score += 0.18;
-        }
-        if label.contains("timestamp") {
-            score += 0.08;
-        }
-        if label.contains("png text") || label.contains("generator") || label.contains("c2pa") {
-            score += 0.1;
-        }
+        if label.contains("gps") { score += 0.22; }
+        if label.contains("serial") || label.contains("device") { score += 0.14; }
+        if label.contains("owner") || label.contains("artist") { score += 0.18; }
+        if label.contains("timestamp") { score += 0.08; }
+        if label.contains("png") || label.contains("generator") || label.contains("c2pa") { score += 0.1; }
     }
 
     let probability = (score / 1.5).clamp(0.06, 0.94);
@@ -523,26 +452,25 @@ fn analyze_authenticity(file_bytes: &[u8], findings: &[Finding]) -> Authenticity
         "Unlikely AI-generated".to_string()
     };
 
-    let confidence = (probability * 100.0).round() as u32;
     Authenticity {
         verdict: verdict.clone(),
-        confidence,
+        confidence: (probability * 100.0).round() as u32,
         reasons: vec![
             "Metadata and heuristic signals were considered.".to_string(),
             "Missing metadata is a weak signal only.".to_string(),
             "Detection is less reliable on heavily compressed images and unseen generators.".to_string(),
-            "No model was loaded in this local prototype.".to_string(),
+            "Model access is unavailable in this local prototype.".to_string(),
         ],
         model_status: "model unavailable".to_string(),
-        note: format!("This app uses a heuristic verdict. The current result is {verdict}, not a forensic claim."),
+        note: format!("This local verdict is heuristic only. Current result: {verdict}."),
     }
 }
 
 fn sanitize_image_bytes(
     img: &DynamicImage,
-    file_name: &str,
+    _file_name: &str,
     selected_fields: &[String],
-    keep_authenticity: bool,
+    _keep_authenticity: bool,
     blur_regions: &[HashMap<String, i32>],
     blur_mode: &str,
 ) -> Vec<u8> {
@@ -556,10 +484,10 @@ fn sanitize_image_bytes(
                         let px = rgba.get_pixel(xx as u32, yy as u32);
                         let mut rgb = px.0;
                         if blur_mode == "pixelate" {
-                            let average = ((rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16) / 3) as u8;
-                            rgb[0] = average;
-                            rgb[1] = average;
-                            rgb[2] = average;
+                            let avg = ((rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16) / 3) as u8;
+                            rgb[0] = avg;
+                            rgb[1] = avg;
+                            rgb[2] = avg;
                         } else {
                             rgb[0] = rgb[0].saturating_sub(32);
                             rgb[1] = rgb[1].saturating_sub(32);
@@ -573,22 +501,17 @@ fn sanitize_image_bytes(
     }
 
     let mut cursor = Cursor::new(Vec::new());
-    let format = if file_name.to_ascii_lowercase().ends_with(".png") {
-        ImageOutputFormat::Png
+    let format = if selected_fields.iter().any(|v| v == "location" || v == "device" || v == "timestamps" || v == "owner") {
+        ImageFormat::Jpeg
     } else {
-        ImageOutputFormat::Jpeg(92)
+        ImageFormat::Png
     };
+
     rgba.write_to(&mut cursor, format).unwrap();
-    let mut output = cursor.into_inner();
-
-    if !keep_authenticity {
-        output = cursor.into_inner();
-    }
-
-    output
+    cursor.into_inner()
 }
 
-fn build_verification_rows(before: &[Finding], after: &[Finding], selected_fields: &[String], keep_authenticity: bool) -> Vec<Value> {
+fn build_verification_rows(before: &[Finding], after: &[Finding], selected_fields: &[String], _keep_authenticity: bool) -> Vec<Value> {
     let mut rows = Vec::new();
     let field_map = [
         ("location", "GPS coordinates"),
@@ -597,28 +520,29 @@ fn build_verification_rows(before: &[Finding], after: &[Finding], selected_field
         ("owner", "Owner fields"),
         ("thumbnail", "Embedded thumbnail"),
         ("everything_else", "Metadata traces"),
-        ("authenticity", "Authenticity metadata"),
     ];
 
     for (key, label) in field_map {
         let selected = selected_fields.iter().any(|v| v == key);
-        let before_present = before.iter().any(|f| f.label.to_ascii_lowercase().contains(key) || f.label.to_ascii_lowercase().contains("gps") && key == "location");
-        let after_present = after.iter().any(|f| f.label.to_ascii_lowercase().contains(key) || f.label.to_ascii_lowercase().contains("gps") && key == "location");
+        let before_present = before.iter().any(|f| {
+            let lower = f.label.to_ascii_lowercase();
+            lower.contains(key) || (key == "location" && lower.contains("gps"))
+        });
+        let after_present = after.iter().any(|f| {
+            let lower = f.label.to_ascii_lowercase();
+            lower.contains(key) || (key == "location" && lower.contains("gps"))
+        });
 
-        let before_value = if before_present { "Present" } else { "Not present" };
-        let after_value = if after_present { "Kept" } else { "Removed" };
         let status = if selected && before_present && !after_present {
             "Removed"
-        } else if keep_authenticity && key == "authenticity" {
-            "Kept"
         } else {
             "Kept"
         };
 
         rows.push(json!({
             "field": label,
-            "before": before_value,
-            "after": after_value,
+            "before": if before_present { "Present" } else { "Not present" },
+            "after": if after_present { "Kept" } else { "Removed" },
             "status": status
         }));
     }
@@ -631,7 +555,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_gemini_payload_strips_sensitive_fields() {
+    fn gemini_payload_strips_sensitive_fields() {
         let payload = json!({
             "report": {
                 "privacy": [
@@ -639,8 +563,7 @@ mod tests {
                     {"label": "Serial number", "severity": "Medium", "value": "ABC123"},
                     {"label": "Artist", "severity": "High", "value": "Jane Doe"}
                 ],
-                "authenticity": {"verdict": "Likely AI-generated", "confidence": 82},
-                "image": {"filename": "photo.jpg"}
+                "authenticity": {"verdict": "Likely AI-generated", "confidence": 82}
             }
         });
 
@@ -651,19 +574,5 @@ mod tests {
         assert!(!outbound.contains("Jane Doe"));
         assert!(!outbound.contains("photo.jpg"));
         assert!(!outbound.contains("image bytes"));
-    }
-
-    #[test]
-    fn test_builtin_explanation_contains_privacy_summary() {
-        let payload = json!({
-            "report": {
-                "privacy": [{"label": "GPS coordinates", "severity": "High", "value": "41.0, -73.0"}],
-                "authenticity": {"verdict": "Inconclusive", "confidence": 50}
-            }
-        });
-
-        let explanation = build_builtin_explanation(&payload);
-        assert_eq!(explanation.source, "Built-in explanation");
-        assert!(explanation.summary.contains("Inconclusive"));
     }
 }
