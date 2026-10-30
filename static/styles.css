@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TruthVision Lens</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <div>
+          <h1>TruthVision Lens</h1>
+          <div class="tagline">Know what a photo is. Control what it reveals.</div>
+        </div>
+      </header>
+
+      <main class="main-layout">
+        <section class="panel panel-left">
+          <div class="section-header">
+            <h2>Image</h2>
+          </div>
+          <div id="upload-box" class="upload-box" tabindex="0">
+            <input id="file-input" type="file" accept="image/jpeg,image/png" />
+            <label for="file-input">Choose image or drag here</label>
+            <div class="helper">JPEG and PNG up to 15 MB</div>
+          </div>
+
+          <div id="image-stage" class="image-stage hidden" aria-live="polite">
+            <img id="preview-image" alt="Uploaded preview" />
+            <div id="overlay-layer" class="overlay-layer"></div>
+          </div>
+
+          <div id="analysis-status" class="analysis-status hidden">Analyzing...</div>
+        </section>
+
+        <section class="panel panel-right">
+          <div class="report-box">
+            <div class="report-heading">
+              <h2>Privacy report</h2>
+            </div>
+            <div id="report-empty" class="empty-state">Upload a photo to begin the report.</div>
+            <div id="privacy-table" class="report-table hidden"></div>
+          </div>
+
+          <div class="auth-box">
+            <div class="section-header">
+              <h2>Authenticity analysis</h2>
+            </div>
+            <div id="authenticity-panel" class="authenticity-panel hidden">
+              <div class="verdict-row">
+                <div id="verdict-text" class="verdict-text">Inconclusive</div>
+              </div>
+              <div class="confidence-row">
+                <div class="confidence-line"><span id="confidence-tick"></span></div>
+              </div>
+              <div class="confidence-label"><span id="confidence-value">0%</span> confidence</div>
+              <ul id="reasons-list" class="reasons-list"></ul>
+            </div>
+          </div>
+
+          <div class="clean-box">
+            <div class="section-header">
+              <h2>Selective cleaning</h2>
+            </div>
+            <div id="clean-controls" class="clean-controls hidden">
+              <div class="checkbox-grid">
+                <label><input type="checkbox" value="location" checked /> Location</label>
+                <label><input type="checkbox" value="device" checked /> Device</label>
+                <label><input type="checkbox" value="timestamps" checked /> Timestamps</label>
+                <label><input type="checkbox" value="owner" checked /> Owner info</label>
+                <label><input type="checkbox" value="thumbnail" checked /> Thumbnail</label>
+                <label><input type="checkbox" value="everything_else" checked /> Everything else</label>
+              </div>
+
+              <label class="toggle-row"><input id="keep-authenticity" type="checkbox" checked /> Keep authenticity-related fields (software tag)</label>
+
+              <div class="blur-row">
+                <label for="blur-mode">Blur mode</label>
+                <select id="blur-mode">
+                  <option value="gaussian">Gaussian blur</option>
+                  <option value="pixelate">Pixelation</option>
+                </select>
+              </div>
+
+              <div class="button-row">
+                <button id="clean-button" class="primary-button" type="button">Clean &amp; download</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="verification-box">
+            <div class="section-header">
+              <h2>Verification</h2>
+            </div>
+            <div id="verification-table" class="verification-table hidden"></div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        All uploads are processed locally and no filenames or image data are logged or sent anywhere.
+      </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

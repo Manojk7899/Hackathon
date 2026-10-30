@@ -1,0 +1,125 @@
+# TruthVision Lens
+
+TruthVision Lens is a local-first forensic image review and sanitization tool. It inspects an uploaded photo for embedded metadata leaks, face and license plate detection, and available authenticity signals, then lets the user selectively remove risky metadata and blur sensitive regions before downloading a cleaned file.
+
+This project is designed to run fully on localhost without uploading anything to a third-party service.
+
+## What it is
+
+TruthVision Lens helps a user answer two questions about a local image:
+
+1. Is it likely AI-generated or manipulated?
+2. Does it leak personal data such as location, device details, timestamps, ownership fields, or thumbnails?
+
+The app does not send files anywhere. All processing happens on the local machine.
+
+## Start here
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+Then open:
+
+http://localhost:8000
+
+## Project layout
+
+- `app.py` - FastAPI server and static file serving
+- `metadata.py` - EXIF/XMP/PNG metadata parsing and selective removal
+- `detect.py` - face and plate detection, region blurring
+- `authenticity.py` - model and metadata-based authenticity analysis
+- `static/index.html` - main interface
+- `static/styles.css` - offline styling and forensic report layout
+- `static/app.js` - upload, analysis, cleaning, and download behavior
+- `samples/generate_samples.py` - creates a plain image, an image with fake GPS/device EXIF, and a low-quality JPEG
+
+## Privacy and safety notes
+
+- No analytics, no logging of filenames, and no image uploads to external services.
+- Uploads are processed in memory or in a temporary file and removed immediately after the request.
+- Re-saving a file strips metadata and may remove C2PA signatures. This is disclosed in the UI.
+
+## Known limitations
+
+- Detection drops on unseen generators and heavy compression.
+- Missing metadata is a weak signal.
+- Metadata removal does not remove visible identifiers or camera sensor fingerprints (PRNU).
+- Plate and face detection are basic and will miss cases.
+
+## Evaluation
+
+This section is intentionally a placeholder for team measurements.
+
+| Test / item | Result | Notes |
+| --- | --- | --- |
+| AI image detection on known model output | TODO | Fill in measured accuracy and sample count |
+| Manipulated image detection on edited JPEGs | TODO | Fill in dataset details |
+| Privacy leak detection on location-heavy EXIF | TODO | Fill in recall and false positives |
+| Plate detection reliability | TODO | Fill in precision/recall |
+| Face detection reliability | TODO | Fill in dataset and false positives |
+| Metadata stripping verification | TODO | Fill in before/after checks |
+
+## What existed before the hackathon
+
+Placeholder: this project was created from a scratch build during the hackathon and is intended for rapid local forensic review. The original baseline before this effort was a blank repository without the application code, analysis pipeline, or validation workflow.
+
+## Model behavior and fallbacks
+
+The authenticity model tries the following order:
+
+1. `umm-maybe/AI-image-detector`
+2. `Organika/sdxl-detector`
+
+If neither model can be loaded, the app still runs and reports an authenticity verdict based on metadata-only signals, while clearly stating that the model is unavailable.
+
+## Sample generation
+
+The sample generator creates three local test images:
+
+- `samples/generated/fake_exif_photo.jpg` - image with GPS, device, and timestamp EXIF
+- `samples/generated/plain_photo.jpg` - clean image with little or no metadata
+- `samples/generated/low_quality_photo.jpg` - re-saved JPEG at low quality
+
+It does not invent AI-generated samples; if you need a synthetic AI image for testing, drop your own file into the `samples/` folder and test it through the UI.
+
+## Live behavior summary
+
+- Upload a JPEG or PNG under 15 MB.
+- Extract and present privacy findings.
+- Detect faces and license plates, then allow selective blur.
+- Analyze authenticity using model and metadata signals.
+- Remove selected metadata fields and region blur.
+- Download the cleaned copy and verify the change.
+
+## Demo script (2 minutes)
+
+1. Open the app and upload a phone photo that embeds location data.
+2. Review the privacy report: location, device, timestamps, and owner fields.
+3. Select the location and owner metadata and click Clean & Download.
+4. Compare before/after metadata values in the verification table.
+5. Upload an AI-generated test image or a high-contrast synthetic sample from your own set.
+6. Review the authenticity verdict and note the model fallback and metadata-only limitations.
+7. Explain the limitations: heavy compression, unseen generators, and metadata-only detection are weaker than a full forensic pipeline.
+
+## Notes
+
+This project favors a working, honest, local-first application over a broad feature set. The UI is intentionally designed to resemble a forensic lab report rather than a SaaS landing page.
+
+## Known model and package notes
+
+- `transformers` and `torch` are used for optional AI model inference.
+- The app gracefully falls back if the model does not load.
+- `c2pa-python` is not required for the app to run; if present, it is used for better C2PA detection, otherwise the byte-level marker scan is used.
+- `opencv-python-headless` is used for face and plate detection without a desktop GUI dependency.
+
+## License
+
+This project is a local hackathon prototype. It is intended for non-production research and testing on local machines.
+
+"""
+
+{"content":"fastapi==0.115.5\nuvicorn==0.30.6\nPillow==10.4.0\npiexif==1.6.1\nopencv-python-headless==4.10.0.84\nnumpy==2.1.4\npython-multipart==0.0.9\ntransformers==4.45.2\ntorch==2.5.1\n
