@@ -1,148 +1,231 @@
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
-import io
 import json
 import os
-import numpy as np
+import time
+from collections import defaultdict, deque
+from typing import Any, Dict, List
 
-from metadata import extract_metadata, apply_metadata_cleanup, verify_cleanup
-from detect import detect_faces_and_plates, apply_region_blur
-from authenticity import analyze_authenticity
+from dotenv import load_dotenv
 
-app = FastAPI(title="TruthVision Lens")
+load_dotenv()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT_SECONDS = 15
+RATE_LIMIT_CALLS = 3
+RATE_LIMIT_WINDOW_SECONDS = 60
 
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+try:
+    from google import genai
+except Exception:  # pragma: no cover
+    genai = None
 
-@app.get("/")
-def index():
-    with open(os.path.join(static_dir, "index.html"), "r", encoding="utf-8") as f:
-        return f.read()
+REQUEST_TIMESTAMPS: Dict[str, deque] = defaultdict(deque)
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file was uploaded.")
+def _get_client_ip(client_ip: str | None) -> str:
+    return client_ip or "anonymous"
 
-    content = await file.read()
-    if len(content) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File exceeds 15 MB limit.")
 
-    try:
-        image = Image.open(io.BytesIO(content))
-        image.verify()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Unsupported or unreadable image: {exc}") from exc
+def _rate_limit_allowed(client_ip: str | None) -> bool:
+    client_id = _get_client_ip(client_ip)
+    now = time.monotonic()
+    bucket = REQUEST_TIMESTAMPS[client_id]
+    while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_CALLS:
+        return False
+    bucket.append(now)
+    return True
 
-    try:
-        image = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not decode image: {exc}") from exc
 
-    metadata = extract_metadata(content, file.filename)
-    faces, plates = detect_faces_and_plates(np.array(image))
+def summarize_findings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    report = payload.get("report", payload)
+    privacy = report.get("privacy", report.get("findings", []))
+    authenticity = report.get("authenticity", {})
+    regions = report.get("regions", {})
+    face_count = len(regions.get("faces", []))
+    plate_count = len(regions.get("plates", []))
 
-    authenticity = analyze_authenticity(content, metadata)
+    findings: List[str] = []
+    if isinstance(privacy, list):
+        for item in privacy:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            severity = str(item.get("severity", "")).strip()
+            if label and severity:
+                findings.append(f"{label}: {severity.lower()} severity")
 
-    report = {
-        "image": {
-            "filename": file.filename,
-            "width": image.width,
-            "height": image.height,
-            "format": image.format or "unknown",
-            "size_bytes": len(content),
-        },
-        "privacy": metadata.get("findings", []),
-        "regions": {
-            "faces": faces,
-            "plates": plates,
-        },
-        "authenticity": authenticity,
+    model_bucket = "unknown"
+    if isinstance(authenticity, dict):
+        if authenticity.get("model_status") == "model unavailable":
+            model_bucket = "unknown"
+        else:
+            probability = authenticity.get("probability")
+            if probability is not None:
+                if probability >= 0.66:
+                    model_bucket = "high"
+                elif probability >= 0.42:
+                    model_bucket = "medium"
+                else:
+                    model_bucket = "low"
+
+    summary_bits = []
+    if findings:
+        summary_bits.append("The file contains privacy signals including metadata and location-related details")
+    if face_count:
+        summary_bits.append(f"{face_count} face region(s) were detected")
+    if plate_count:
+        summary_bits.append(f"{plate_count} plate region(s) were detected")
+    if not summary_bits:
+        summary_bits.append("The file appears to have minimal embedded metadata")
+
+    summary = " ".join(summary_bits) + ". " + (
+        f"Authenticity is {authenticity.get('verdict', 'Inconclusive').lower()} with {authenticity.get('confidence', 0)}% confidence and a {model_bucket} model signal."
+    )
+
+    risks = []
+    if findings:
+        risks.extend(findings[:3])
+    if authenticity.get("verdict"):
+        risks.append(f"Authenticity verdict: {authenticity.get('verdict')}")
+    if not risks:
+        risks.append("No strong privacy or authenticity signals were found.")
+
+    next_steps = [
+        "Review the selected metadata groups before saving a cleaned copy.",
+        "Remove the flagged location and owner details if they are not needed.",
+        "Keep the result file local and avoid sharing it until the privacy risks are checked."
+    ]
+
+    return {
+        "summary": summary,
+        "risks": risks[:4],
+        "next_steps": next_steps[:3],
     }
 
-    return JSONResponse(content={"report": report})
+
+def build_builtin_explanation(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = summarize_findings(payload)
+    return {
+        "available": False,
+        "source": "Built-in explanation",
+        "summary": sanitized["summary"],
+        "risks": sanitized["risks"],
+        "next_steps": sanitized["next_steps"],
+    }
 
 
-@app.post("/clean")
-async def clean(
-    file: UploadFile = File(...),
-    selected_fields: str = Form(default="[]"),
-    keep_authenticity_fields: str = Form(default="false"),
-    blur_regions: str = Form(default="[]"),
-    blur_mode: str = Form(default="gaussian"),
-):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file was uploaded.")
+def _safe_json_dumps(data: Dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=True, separators=(",", ":"))
 
-    content = await file.read()
-    if len(content) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File exceeds 15 MB limit.")
 
-    try:
-        data = json.loads(selected_fields)
-    except json.JSONDecodeError:
-        data = []
+def build_gemini_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = summarize_findings(payload)
+    return {
+        "summary": sanitized["summary"],
+        "risks": sanitized["risks"],
+        "next_steps": sanitized["next_steps"],
+    }
 
-    try:
-        region_data = json.loads(blur_regions)
-    except json.JSONDecodeError:
-        region_data = []
 
-    keep_authenticity = str(keep_authenticity_fields).lower() == "true"
-    blur_mode = blur_mode if blur_mode in {"gaussian", "pixelate"} else "gaussian"
+def validate_explanation_response(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"summary": str(data), "risks": [], "next_steps": []}
+    summary = str(data.get("summary", "")).strip()
+    risks = data.get("risks", [])
+    next_steps = data.get("next_steps", [])
+    if not isinstance(risks, list):
+        risks = []
+    if not isinstance(next_steps, list):
+        next_steps = []
+    if not summary:
+        summary = "The system could not generate a structured explanation for this report."
+    return {
+        "summary": summary,
+        "risks": [str(item) for item in risks[:4]],
+        "next_steps": [str(item) for item in next_steps[:3]],
+    }
 
-    try:
-        image = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not decode image: {exc}") from exc
 
-    original_meta = extract_metadata(content, file.filename)
-    cleaned_bytes, cleaned_meta = apply_metadata_cleanup(
-        content,
-        selected_fields=data,
-        keep_authenticity_fields=keep_authenticity,
-        file_name=file.filename,
+def _call_gemini(payload: Dict[str, Any]) -> str:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    if genai is None:
+        raise RuntimeError("google-genai is not installed")
+
+    client = genai.Client(api_key=api_key)
+    system_instruction = (
+        "Explain for a non-technical reader. Stay calibrated. Never say an image is definitely real or fake. "
+        "Describe verdicts as likelihoods. Mention that missing metadata is a weak signal and that detection is less reliable on compressed images and unseen generators when relevant. "
+        "Invent nothing beyond the provided findings. No markdown headers, no emoji, no exclamation marks. About 180 words maximum."
     )
+    request = _safe_json_dumps(payload)
+    response = client.models.generate_content(
+        model=os.getenv("GEMINI_MODEL", DEFAULT_MODEL),
+        contents=request,
+        config={"system_instruction": system_instruction, "temperature": 0.2},
+    )
+    if hasattr(response, "text"):
+        return str(response.text)
+    if hasattr(response, "candidates"):
+        for candidate in response.candidates:
+            if hasattr(candidate, "content"):
+                return str(candidate.content)
+    return str(response)
 
-    cleaned_image = Image.open(io.BytesIO(cleaned_bytes))
-    cleaned_image = apply_region_blur(cleaned_image, region_data, blur_mode=blur_mode)
-    output_buffer = io.BytesIO()
-    cleaned_image.save(output_buffer, format=("PNG" if file.filename.lower().endswith(".png") else "JPEG"), quality=95)
-    cleaned_image_bytes = output_buffer.getvalue()
 
-    verification = verify_cleanup(original_meta, cleaned_meta, selection=data, keep_authenticity_fields=keep_authenticity)
+def explain_findings(payload: Dict[str, Any], client_ip: str | None = None) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return build_builtin_explanation({})
 
-    return JSONResponse(
-        content={
-            "filename": file.filename,
-            "cleaned_image_base64": __import__("base64").b64encode(cleaned_image_bytes).decode("utf-8"),
-            "verification": verification,
-            "removed_fields": data,
-            "blur_mode": blur_mode,
-            "note": "Re-saving removes C2PA signatures and embedded metadata, and may not erase visible identifiers or sensor fingerprints.",
+    sanitized = build_gemini_payload(payload)
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        result = build_builtin_explanation(payload)
+        result["available"] = False
+        return result
+
+    if not _rate_limit_allowed(client_ip):
+        result = build_builtin_explanation(payload)
+        result["available"] = False
+        result["summary"] = "The explanation service is temporarily rate-limited. The built-in explanation is shown instead."
+        return result
+
+    try:
+        raw = _call_gemini(sanitized)
+    except TimeoutError:
+        result = build_builtin_explanation(payload)
+        result["available"] = False
+        result["summary"] = "The explanation request timed out. The built-in explanation is shown instead."
+        return result
+    except Exception:
+        result = build_builtin_explanation(payload)
+        result["available"] = False
+        result["summary"] = "The explanation service is unavailable. The built-in explanation is shown instead."
+        return result
+
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        mapped = validate_explanation_response({"summary": raw, "risks": [], "next_steps": []})
+        return {
+            "available": True,
+            "source": "Written by Gemini",
+            **mapped,
         }
-    )
+
+    validated = validate_explanation_response(parsed)
+    return {
+        "available": True,
+        "source": "Written by Gemini",
+        **validated,
+    }
 
 
-app.mount("/", StaticFiles(directory=static_dir, html=True), name="root")
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
-
+__all__ = [
+    "build_builtin_explanation",
+    "build_gemini_payload",
+    "explain_findings",
+    "validate_explanation_response",
+]

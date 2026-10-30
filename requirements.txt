@@ -1,125 +1,190 @@
-# TruthVision Lens
+from __future__ import annotations
 
-TruthVision Lens is a local-first forensic image review and sanitization tool. It inspects an uploaded photo for embedded metadata leaks, face and license plate detection, and available authenticity signals, then lets the user selectively remove risky metadata and blur sensitive regions before downloading a cleaned file.
+import base64
+import io
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict
 
-This project is designed to run fully on localhost without uploading anything to a third-party service.
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
+import numpy as np
 
-## What it is
+from authenticity import analyze_authenticity
+from detect import apply_region_blur, detect_faces_and_plates
+from explain import build_builtin_explanation, explain_findings
+from metadata import apply_metadata_cleanup, extract_metadata, verify_cleanup
 
-TruthVision Lens helps a user answer two questions about a local image:
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
-1. Is it likely AI-generated or manipulated?
-2. Does it leak personal data such as location, device details, timestamps, ownership fields, or thumbnails?
+app = FastAPI(title="TruthVision Lens")
 
-The app does not send files anywhere. All processing happens on the local machine.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-## Start here
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
 
-Then open:
+@app.get("/", include_in_schema=False)
+async def root() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
 
-http://localhost:8000
 
-## Project layout
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
-- `app.py` - FastAPI server and static file serving
-- `metadata.py` - EXIF/XMP/PNG metadata parsing and selective removal
-- `detect.py` - face and plate detection, region blurring
-- `authenticity.py` - model and metadata-based authenticity analysis
-- `static/index.html` - main interface
-- `static/styles.css` - offline styling and forensic report layout
-- `static/app.js` - upload, analysis, cleaning, and download behavior
-- `samples/generate_samples.py` - creates a plain image, an image with fake GPS/device EXIF, and a low-quality JPEG
 
-## Privacy and safety notes
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)) -> JSONResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file was uploaded.")
 
-- No analytics, no logging of filenames, and no image uploads to external services.
-- Uploads are processed in memory or in a temporary file and removed immediately after the request.
-- Re-saving a file strips metadata and may remove C2PA signatures. This is disclosed in the UI.
+    filename = file.filename.lower()
+    if not (filename.endswith(".jpg") or filename.endswith(".jpeg") or filename.endswith(".png")):
+        raise HTTPException(status_code=400, detail="Unsupported image type. Use JPEG or PNG.")
 
-## Known limitations
+    content = await file.read()
+    if len(content) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 15 MB limit.")
 
-- Detection drops on unseen generators and heavy compression.
-- Missing metadata is a weak signal.
-- Metadata removal does not remove visible identifiers or camera sensor fingerprints (PRNU).
-- Plate and face detection are basic and will miss cases.
+    try:
+        with Image.open(io.BytesIO(content)) as img:
+            img.verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unsupported or unreadable image: {exc}") from exc
 
-## Evaluation
+    try:
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not decode image: {exc}") from exc
 
-This section is intentionally a placeholder for team measurements.
+    metadata = extract_metadata(content, file.filename)
+    faces, plates = detect_faces_and_plates(np.array(image))
+    authenticity = analyze_authenticity(content, metadata)
 
-| Test / item | Result | Notes |
-| --- | --- | --- |
-| AI image detection on known model output | TODO | Fill in measured accuracy and sample count |
-| Manipulated image detection on edited JPEGs | TODO | Fill in dataset details |
-| Privacy leak detection on location-heavy EXIF | TODO | Fill in recall and false positives |
-| Plate detection reliability | TODO | Fill in precision/recall |
-| Face detection reliability | TODO | Fill in dataset and false positives |
-| Metadata stripping verification | TODO | Fill in before/after checks |
+    report = {
+        "image": {
+            "filename": file.filename,
+            "width": image.width,
+            "height": image.height,
+            "format": image.format or "unknown",
+            "size_bytes": len(content),
+        },
+        "privacy": metadata.get("findings", []),
+        "regions": {
+            "faces": faces,
+            "plates": plates,
+        },
+        "authenticity": authenticity,
+    }
+    return JSONResponse(content={"report": report})
 
-## What existed before the hackathon
 
-Placeholder: this project was created from a scratch build during the hackathon and is intended for rapid local forensic review. The original baseline before this effort was a blank repository without the application code, analysis pipeline, or validation workflow.
+@app.post("/clean")
+async def clean(
+    file: UploadFile = File(...),
+    selected_fields: str = Form(default="[]"),
+    keep_authenticity_fields: str = Form(default="false"),
+    blur_regions: str = Form(default="[]"),
+    blur_mode: str = Form(default="gaussian"),
+) -> JSONResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file was uploaded.")
 
-## Model behavior and fallbacks
+    content = await file.read()
+    if len(content) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 15 MB limit.")
 
-The authenticity model tries the following order:
+    try:
+        selected_values = json.loads(selected_fields)
+        if not isinstance(selected_values, list):
+            selected_values = []
+    except json.JSONDecodeError:
+        selected_values = []
 
-1. `umm-maybe/AI-image-detector`
-2. `Organika/sdxl-detector`
+    try:
+        region_data = json.loads(blur_regions)
+        if not isinstance(region_data, list):
+            region_data = []
+    except json.JSONDecodeError:
+        region_data = []
 
-If neither model can be loaded, the app still runs and reports an authenticity verdict based on metadata-only signals, while clearly stating that the model is unavailable.
+    keep_authenticity = str(keep_authenticity_fields).lower() == "true"
+    blur_mode = blur_mode if blur_mode in {"gaussian", "pixelate"} else "gaussian"
 
-## Sample generation
+    try:
+        Image.open(io.BytesIO(content)).verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unsupported or unreadable image: {exc}") from exc
 
-The sample generator creates three local test images:
+    before_meta = extract_metadata(content, file.filename)
+    cleaned_bytes, cleaned_meta = apply_metadata_cleanup(
+        content,
+        selected_fields=selected_values,
+        keep_authenticity_fields=keep_authenticity,
+        file_name=file.filename,
+    )
 
-- `samples/generated/fake_exif_photo.jpg` - image with GPS, device, and timestamp EXIF
-- `samples/generated/plain_photo.jpg` - clean image with little or no metadata
-- `samples/generated/low_quality_photo.jpg` - re-saved JPEG at low quality
+    try:
+        cleaned_image = Image.open(io.BytesIO(cleaned_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not decode cleaned image: {exc}") from exc
 
-It does not invent AI-generated samples; if you need a synthetic AI image for testing, drop your own file into the `samples/` folder and test it through the UI.
+    blurred_image = apply_region_blur(cleaned_image, region_data, blur_mode=blur_mode)
+    output_buffer = io.BytesIO()
+    output_format = "PNG" if file.filename.lower().endswith(".png") else "JPEG"
+    blurred_image.save(output_buffer, format=output_format, quality=95)
+    cleaned_image_bytes = output_buffer.getvalue()
 
-## Live behavior summary
+    verification = verify_cleanup(
+        before_meta,
+        cleaned_meta,
+        selection=selected_values,
+        keep_authenticity_fields=keep_authenticity,
+    )
 
-- Upload a JPEG or PNG under 15 MB.
-- Extract and present privacy findings.
-- Detect faces and license plates, then allow selective blur.
-- Analyze authenticity using model and metadata signals.
-- Remove selected metadata fields and region blur.
-- Download the cleaned copy and verify the change.
+    return JSONResponse(
+        content={
+            "filename": file.filename,
+            "cleaned_image_base64": base64.b64encode(cleaned_image_bytes).decode("utf-8"),
+            "verification": verification,
+            "removed_fields": selected_values,
+            "blur_mode": blur_mode,
+            "note": "Re-saving removes any C2PA signature and embedded metadata, and may not erase visible identifiers or sensor fingerprints.",
+        }
+    )
 
-## Demo script (2 minutes)
 
-1. Open the app and upload a phone photo that embeds location data.
-2. Review the privacy report: location, device, timestamps, and owner fields.
-3. Select the location and owner metadata and click Clean & Download.
-4. Compare before/after metadata values in the verification table.
-5. Upload an AI-generated test image or a high-contrast synthetic sample from your own set.
-6. Review the authenticity verdict and note the model fallback and metadata-only limitations.
-7. Explain the limitations: heavy compression, unseen generators, and metadata-only detection are weaker than a full forensic pipeline.
+@app.post("/explain")
+async def explain(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
 
-## Notes
+    if not isinstance(payload, dict):
+        payload = {}
 
-This project favors a working, honest, local-first application over a broad feature set. The UI is intentionally designed to resemble a forensic lab report rather than a SaaS landing page.
+    client_ip = request.client.host if request.client else None
+    explanation = explain_findings(payload, client_ip=client_ip)
+    return JSONResponse(content=explanation)
 
-## Known model and package notes
 
-- `transformers` and `torch` are used for optional AI model inference.
-- The app gracefully falls back if the model does not load.
-- `c2pa-python` is not required for the app to run; if present, it is used for better C2PA detection, otherwise the byte-level marker scan is used.
-- `opencv-python-headless` is used for face and plate detection without a desktop GUI dependency.
+app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="root")
 
-## License
 
-This project is a local hackathon prototype. It is intended for non-production research and testing on local machines.
+if __name__ == "__main__":
+    import uvicorn
 
-"""
-
-{"content":"fastapi==0.115.5\nuvicorn==0.30.6\nPillow==10.4.0\npiexif==1.6.1\nopencv-python-headless==4.10.0.84\nnumpy==2.1.4\npython-multipart==0.0.9\ntransformers==4.45.2\ntorch==2.5.1\n
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)

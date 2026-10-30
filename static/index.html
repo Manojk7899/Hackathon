@@ -1,96 +1,61 @@
-import io
-import os
-from typing import Any, Dict, List
+#!/usr/bin/env python3
+from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
+import piexif
 
-try:
-    import torch
-    from transformers import AutoImageProcessor, AutoModelForImageClassification
-except Exception:
-    torch = None
-    AutoImageProcessor = None
-    AutoModelForImageClassification = None
+ROOT = Path(__file__).resolve().parent.parent
+OUT_DIR = ROOT / "samples" / "generated"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _get_model_candidates():
-    return [
-        "umm-maybe/AI-image-detector",
-        "Organika/sdxl-detector",
-    ]
+def make_fake_exif_photo(path: Path):
+    img = Image.new("RGB", (1200, 900), color=(238, 232, 225))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((120, 200, 1080, 700), fill=(248, 243, 236), outline=(55, 55, 55), width=3)
+    draw.text((220, 340), "Sample with fake GPS and device metadata", fill=(20, 20, 20), font=None)
 
-
-def analyze_authenticity(file_bytes: bytes, metadata: Dict[str, Any]) -> Dict[str, Any]:
-    reasons: List[str] = []
-    model_probability = None
-    model_status = "Model unavailable"
-    model_name = ""
-
-    if AutoImageProcessor is not None and AutoModelForImageClassification is not None and torch is not None:
-        for candidate in _get_model_candidates():
-            try:
-                processor = AutoImageProcessor.from_pretrained(candidate)
-                model = AutoModelForImageClassification.from_pretrained(candidate)
-                model.eval()
-                model_name = candidate
-                model_status = "Loaded"
-                image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-                inputs = processor(images=image, return_tensors="pt")
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    logits = outputs.logits
-                    prob = torch.softmax(logits, dim=-1)
-                    # Most classification heads use AI-generated as the positive class when present.
-                    # If the model has binary output, the AI class is likely the last index.
-                    model_probability = float(prob[0][-1].item()) if prob.dim() > 1 else float(prob.item())
-                break
-            except Exception:
-                model_status = "Model unavailable"
-                model_name = ""
-                model_probability = None
-
-    if metadata.get("software"):
-        reasons.append(f"Software tag: {metadata['software']}")
-    if metadata.get("generator_strings"):
-        reasons.append("Known generator or editing strings appear in metadata.")
-    if metadata.get("c2pa_marker"):
-        reasons.append("C2PA/JUMBF marker detected.")
-    if metadata.get("gps"):
-        reasons.append("GPS coordinates are embedded in the file.")
-    if metadata.get("device"):
-        reasons.append("Device information is embedded in EXIF metadata.")
-    if metadata.get("thumbnail_present"):
-        reasons.append("Embedded thumbnail present.")
-
-    missing_metadata = not metadata.get("software") and not metadata.get("device") and not metadata.get("gps")
-    if missing_metadata:
-        reasons.append("Missing metadata is a weak signal only and does not prove anything by itself.")
-
-    if model_probability is not None:
-        if model_probability >= 0.65:
-            verdict = "Likely AI-generated"
-        elif model_probability >= 0.4:
-            verdict = "Inconclusive"
-        else:
-            verdict = "Unlikely AI-generated"
-        confidence = max(0, min(100, round(model_probability * 100)))
-    else:
-        if reasons:
-            verdict = "Inconclusive"
-            confidence = 52
-        else:
-            verdict = "Inconclusive"
-            confidence = 35
-
-    if len(reasons) == 0:
-        reasons.append("No strong metadata or model cues were found in this file.")
-
-    return {
-        "verdict": verdict,
-        "confidence": confidence,
-        "reasons": reasons,
-        "model_status": model_status,
-        "model_name": model_name,
-        "probability": model_probability,
-        "note": "Detection is less reliable on heavily compressed images and unseen generators. Missing metadata is a weak signal only.",
+    exif_dict = {
+        "0th": {
+            piexif.ImageIFD.Make: "Acme Camera",
+            piexif.ImageIFD.Model: "Model X9",
+            piexif.ImageIFD.Software: "Adobe Photoshop 25.1",
+            piexif.ImageIFD.Artist: "A. Person",
+            piexif.ImageIFD.Copyright: "Copyright A. Person",
+            piexif.ImageIFD.DateTime: "2024:03:02 10:14:31",
+            piexif.ImageIFD.OriginalDate: "2024:03:02 10:14:31",
+            piexif.ImageIFD.DigitalizedDate: "2024:03:02 10:14:31",
+        },
+        "GPS": {
+            piexif.GPSIFD.GPSLatitudeRef: "N",
+            piexif.GPSIFD.GPSLatitude: ((40, 1), (45, 1), (12.5, 1)),
+            piexif.GPSIFD.GPSLongitudeRef: "W",
+            piexif.GPSIFD.GPSLongitude: ((73, 1), (59, 1), (21.4, 1)),
+        },
     }
+    img.save(path, "JPEG", quality=90, exif=piexif.dump(exif_dict))
+
+
+def make_plain_photo(path: Path):
+    img = Image.new("RGB", (1200, 900), color=(244, 242, 237))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((180, 220, 1040, 700), fill=(252, 250, 247), outline=(90, 90, 90), width=2)
+    draw.text((320, 360), "Plain sample photo", fill=(18, 18, 18))
+    img.save(path, "JPEG", quality=90)
+
+
+def make_low_quality_photo(path: Path):
+    src = OUT_DIR / "plain_photo.jpg"
+    img = Image.open(src)
+    img.save(path, "JPEG", quality=35, optimize=True)
+
+
+if __name__ == "__main__":
+    make_fake_exif_photo(OUT_DIR / "fake_exif_photo.jpg")
+    make_plain_photo(OUT_DIR / "plain_photo.jpg")
+    make_low_quality_photo(OUT_DIR / "low_quality_photo.jpg")
+    print("Sample images generated in:", OUT_DIR)
+    print("- fake_exif_photo.jpg: image with GPS and device EXIF")
+    print("- plain_photo.jpg: clean baseline image")
+    print("- low_quality_photo.jpg: low-quality JPEG")
+    print("Add your own AI or synthetic sample for authenticity testing.")

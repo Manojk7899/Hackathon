@@ -1,66 +1,21 @@
+from __future__ import annotations
+
 import io
-import json
+import os
 import re
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from PIL import Image
 import piexif
-from piexif import InvalidImageDataError
 
 
 EXIF_TAG_MAP = {
-    "gps": ["GPS GPSLatitude", "GPS GPSLongitude", "GPS GPSAltitude", "GPS GPSLatitudeRef", "GPS GPSLongitudeRef"],
-    "device": ["0th 271", "0th 272", "0th 273", "0th 274", "0th 306", "0th 315", "0th 34665"],
-    "owner": ["0th 315", "0th 315", "0th 315", "0th 32803", "0th 315"],
-    "timestamps": ["0th 36867", "0th 36868", "0th 306", "GPS GPSDateStamp", "GPS GPSTimeStamp"],
+    "gps": ["GPS GPSLatitude", "GPS GPSLongitude", "GPS GPSLatitudeRef", "GPS GPSLongitudeRef"],
+    "device": ["0th 271", "0th 272", "0th 306", "0th 315"],
+    "owner": ["0th 315", "0th 33432", "0th 0x0009"],
+    "timestamps": ["0th 306", "0th 36867", "0th 36868", "GPS GPSDateStamp", "GPS GPSTimeStamp"],
     "thumbnail": ["1st 513"],
-    "authenticity": ["0th 34665", "0th 305"],
 }
-
-
-def _safe_get_exif(exif_obj: Any) -> Dict[str, Any]:
-    if exif_obj is None:
-        return {}
-    try:
-        return exif_obj.get_ifd(0)
-    except Exception:
-        return {}
-
-
-def _extract_gps_from_exif(exif_dict: Dict[str, Any]) -> Dict[str, Any]:
-    gps_data = exif_dict.get("GPS")
-    if not gps_data:
-        return {}
-
-    lat = gps_data.get(2)
-    lat_ref = gps_data.get(1)
-    lon = gps_data.get(4)
-    lon_ref = gps_data.get(3)
-
-    if not lat or not lon:
-        return {}
-
-    try:
-        lat_dec = _decimal_from_dms(lat, lat_ref)
-        lon_dec = _decimal_from_dms(lon, lon_ref)
-    except Exception:
-        return {}
-
-    return {
-        "latitude": lat_dec,
-        "longitude": lon_dec,
-        "coordinates": {"lat": lat_dec, "lng": lon_dec},
-    }
-
-
-def _decimal_from_dms(dms_value: Any, ref: Any) -> float:
-    if isinstance(dms_value, tuple) and len(dms_value) == 3:
-        deg, minute, sec = dms_value
-        value = float(deg) + (float(minute) / 60.0) + (float(sec) / 3600.0)
-        if ref in ("S", "W"):
-            value *= -1
-        return value
-    return 0.0
 
 
 def _clean_exif_value(value: Any) -> Any:
@@ -74,8 +29,74 @@ def _clean_exif_value(value: Any) -> Any:
     return value
 
 
+def _decimal_from_dms(dms_value: Any, ref: Any) -> float:
+    if isinstance(dms_value, tuple) and len(dms_value) == 3:
+        deg, minute, sec = dms_value
+        try:
+            value = float(deg) + (float(minute) / 60.0) + (float(sec) / 3600.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if ref in ("S", "W"):
+            value *= -1
+        return value
+    if isinstance(dms_value, (int, float)):
+        return float(dms_value)
+    return 0.0
+
+
+def _extract_gps_from_exif(exif_dict: Dict[str, Any]) -> Dict[str, Any]:
+    gps_data = exif_dict.get("GPS", {})
+    if not gps_data:
+        return {}
+    lat = gps_data.get(2)
+    lat_ref = gps_data.get(1)
+    lon = gps_data.get(4)
+    lon_ref = gps_data.get(3)
+    if not lat or not lon:
+        return {}
+    try:
+        lat_dec = _decimal_from_dms(lat, lat_ref)
+        lon_dec = _decimal_from_dms(lon, lon_ref)
+    except Exception:
+        return {}
+    return {
+        "latitude": round(lat_dec, 6),
+        "longitude": round(lon_dec, 6),
+        "coordinates": {"lat": round(lat_dec, 6), "lng": round(lon_dec, 6)},
+    }
+
+
+def _find_generator_strings(meta_fields: Dict[str, Any]) -> List[str]:
+    markers = [
+        "Adobe Photoshop",
+        "Lightroom",
+        "Photoshop",
+        "Canva",
+        "Midjourney",
+        "Stable Diffusion",
+        "DALL-E",
+        "Generative Fill",
+        "Adobe Firefly",
+        "OpenAI",
+        "TensorFlow",
+        "AI",
+        "Camera Raw",
+        "Aperture",
+        "GIMP",
+    ]
+    found: List[str] = []
+    for key, value in meta_fields.items():
+        if not isinstance(value, str):
+            continue
+        lowered = value.lower()
+        for marker in markers:
+            if marker.lower() in lowered:
+                found.append(f"{key}: {value}")
+                break
+    return found
+
+
 def extract_metadata(file_bytes: bytes, filename: str) -> Dict[str, Any]:
-    findings: List[Dict[str, Any]] = []
     metadata: Dict[str, Any] = {
         "filename": filename,
         "gps": {},
@@ -88,19 +109,18 @@ def extract_metadata(file_bytes: bytes, filename: str) -> Dict[str, Any]:
         "c2pa_marker": False,
         "has_png_text": False,
         "all_fields": {},
+        "format": None,
+        "findings": [],
     }
 
-    lower_name = filename.lower()
     try:
         image = Image.open(io.BytesIO(file_bytes))
+        metadata["format"] = image.format or "UNKNOWN"
     except Exception:
         return metadata
 
-    format_name = image.format or "UNKNOWN"
-    metadata["format"] = format_name
-
     try:
-        exif_data = piexif.load(image.info.get("exif", b""))
+        exif_data = piexif.load(image.info.get("exif", b"")) if image.info.get("exif") else {}
     except Exception:
         exif_data = {}
 
@@ -108,52 +128,39 @@ def extract_metadata(file_bytes: bytes, filename: str) -> Dict[str, Any]:
         ifd0 = exif_data.get("0th", {})
         ifd1 = exif_data.get("1st", {})
         gps_data = exif_data.get("GPS", {})
-        metadata["all_fields"] = {**ifd0, **gps_data, **ifd1}
+        metadata["all_fields"].update({**ifd0, **gps_data, **ifd1})
 
         if any(v for v in ifd1.values()):
             metadata["thumbnail_present"] = True
-            findings.append({
-                "label": "Embedded thumbnail present",
-                "value": "Yes",
-                "severity": "Medium",
-            })
+            metadata["findings"].append({"label": "Embedded thumbnail", "value": "Yes", "severity": "Medium"})
 
         software = ifd0.get(305)
         if software:
             metadata["software"] = _clean_exif_value(software)
-            findings.append({
-                "label": "Software tag",
-                "value": metadata["software"],
-                "severity": "Medium",
-            })
+            metadata["findings"].append({"label": "Software tag", "value": metadata["software"], "severity": "Medium"})
 
-        owner_fields = {
+        owner_values = {
             "Artist": ifd0.get(315),
+            "Author": ifd0.get(0x0009),
             "Copyright": ifd0.get(33432),
             "XPAuthor": ifd0.get(0x0009),
         }
-        for key, value in owner_fields.items():
+        for key, value in owner_values.items():
             if value:
-                metadata["owner"][key] = _clean_exif_value(value)
-                findings.append({
-                    "label": key,
-                    "value": _clean_exif_value(value),
-                    "severity": "High" if key in {"Artist", "Copyright"} else "Medium",
-                })
+                cleaned = _clean_exif_value(value)
+                metadata["owner"][key] = cleaned
+                metadata["findings"].append({"label": key, "value": cleaned, "severity": "High"})
 
-        device_fields = {
+        device_values = {
             "Make": ifd0.get(271),
             "Model": ifd0.get(272),
             "Serial Number": ifd0.get(0x000A) if 0x000A in ifd0 else None,
         }
-        for key, value in device_fields.items():
+        for key, value in device_values.items():
             if value:
-                metadata["device"][key] = _clean_exif_value(value)
-                findings.append({
-                    "label": key,
-                    "value": _clean_exif_value(value),
-                    "severity": "Medium" if key in {"Make", "Model"} else "Medium",
-                })
+                cleaned = _clean_exif_value(value)
+                metadata["device"][key] = cleaned
+                metadata["findings"].append({"label": key, "value": cleaned, "severity": "Medium"})
 
         timestamps = {
             "DateTimeOriginal": ifd0.get(36867),
@@ -162,153 +169,111 @@ def extract_metadata(file_bytes: bytes, filename: str) -> Dict[str, Any]:
         }
         for key, value in timestamps.items():
             if value:
-                metadata["timestamps"][key] = _clean_exif_value(value)
-                findings.append({
-                    "label": key,
-                    "value": _clean_exif_value(value),
-                    "severity": "Medium",
-                })
+                cleaned = _clean_exif_value(value)
+                metadata["timestamps"][key] = cleaned
+                metadata["findings"].append({"label": key, "value": cleaned, "severity": "Medium"})
 
         gps = _extract_gps_from_exif(exif_data)
         if gps:
             metadata["gps"] = gps
-            findings.append({
+            metadata["findings"].append({
                 "label": "GPS coordinates",
                 "value": f"{gps['latitude']:.6f}, {gps['longitude']:.6f}",
                 "severity": "High",
             })
 
-    if format_name == "PNG":
+    if metadata["format"] == "PNG":
         png_text = getattr(image, "text", {}) or {}
         if png_text:
             metadata["has_png_text"] = True
             metadata["all_fields"].update(png_text)
             for key, value in png_text.items():
-                if key.lower() in {"software", "comment", "artist", "author", "copyright", "creation_time"}:
-                    metadata["generator_strings"].append(str(value))
-                    findings.append({
+                if isinstance(value, str) and key.lower() in {"software", "comment", "artist", "author", "copyright", "creation_time", "datetime"}:
+                    metadata["generator_strings"].append(f"{key}: {value}")
+                    metadata["findings"].append({
                         "label": key,
-                        "value": str(value),
+                        "value": value,
                         "severity": "High" if key.lower() in {"artist", "author", "copyright"} else "Medium",
                     })
 
-    # Simple generator and editing signals
-    known_strings = [
-        "Adobe Photoshop",
-        "Lightroom",
-        "Pixelmator",
-        "Canva",
-        "Midjourney",
-        "Stable Diffusion",
-        "DALL-E",
-        "Generative Fill",
-        "Adobe Firefly",
-        "OpenAI",
-        "AI",
-        "TensorFlow",
-        "Photoshop",
-    ]
-
-    for key, value in metadata["all_fields"].items():
-        if isinstance(value, str):
-            lowered = value.lower()
-            for marker in known_strings:
-                if marker.lower() in lowered:
-                    metadata["generator_strings"].append(f"{key}: {value}")
-
-    if metadata["generator_strings"]:
-        findings.append({
+    generator_hits = _find_generator_strings(metadata["all_fields"])
+    if generator_hits:
+        metadata["generator_strings"].extend(generator_hits)
+        metadata["findings"].append({
             "label": "Generator or editing metadata",
-            "value": "; ".join(metadata["generator_strings"][:3]),
+            "value": "; ".join(generator_hits[:3]),
             "severity": "Medium",
         })
 
-    # C2PA/JUMBF marker detection fallback
-    if b"c2pa" in file_bytes.lower() or b"jumbf" in file_bytes.lower() or b"\x00\x00\x00\x00\x00\x00\x00\x00" in file_bytes[:64]:
+    lower_bytes = file_bytes.lower()
+    if b"c2pa" in lower_bytes or b"jumbf" in lower_bytes or b"c2pa" in lower_bytes:
         metadata["c2pa_marker"] = True
-        findings.append({
-            "label": "C2PA marker detected",
-            "value": "Marker present",
-            "severity": "Medium",
-        })
+        metadata["findings"].append({"label": "C2PA marker detected", "value": "Marker present", "severity": "Medium"})
 
-    metadata["findings"] = findings
+    metadata["generator_strings"] = list(dict.fromkeys(metadata["generator_strings"]))
     return metadata
 
 
-def _gather_selected_fields(metadata: Dict[str, Any], selected_fields: List[str]) -> List[str]:
+def _gather_selected_fields(selected_fields: List[str]) -> List[str]:
     mapping = {
         "location": ["gps"],
         "device": ["device"],
         "timestamps": ["timestamps"],
         "owner": ["owner"],
         "thumbnail": ["thumbnail_present"],
-        "everything_else": ["software", "generator_strings", "metadata"],
+        "everything_else": ["software", "generator_strings", "c2pa_marker"],
         "authenticity": ["software", "generator_strings"],
     }
-    flattened = []
+    result: List[str] = []
     for field in selected_fields:
-        flattened.extend(mapping.get(field, [field]))
-    return flattened
+        result.extend(mapping.get(field, [field]))
+    return result
 
 
-def apply_metadata_cleanup(file_bytes: bytes, selected_fields: List[str], keep_authenticity_fields: bool, file_name: str) -> Any:
+def apply_metadata_cleanup(file_bytes: bytes, selected_fields: List[str], keep_authenticity_fields: bool, file_name: str):
     image = Image.open(io.BytesIO(file_bytes))
     original = extract_metadata(file_bytes, file_name)
-    processed_bytes = file_bytes
+    processed = file_bytes
+
+    selected = set(selected_fields)
 
     if image.format == "JPEG":
-        exif = piexif.load(image.info.get("exif", b""))
-        if exif:
-            # Remove selected groups from EXIF dictionaries
-            if "location" in selected_fields:
-                exif["GPS"] = {}
-            if "device" in selected_fields:
-                exif["0th"][271] = b""
-                exif["0th"][272] = b""
-            if "timestamps" in selected_fields:
-                exif["0th"][306] = b""
-                exif["0th"][36867] = b""
-                exif["0th"][36868] = b""
-            if "owner" in selected_fields:
-                exif["0th"][315] = b""
-                exif["0th"][33432] = b""
-            if "thumbnail" in selected_fields:
-                exif["1st"] = {}
-            if "everything_else" in selected_fields:
-                exif["0th"][305] = b""
-                exif["0th"][34665] = b""
-            if keep_authenticity_fields:
-                exif["0th"][305] = exif["0th"].get(305)
+        exif = piexif.load(image.info.get("exif", b"")) if image.info.get("exif") else {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+        if "location" in selected:
+            exif["GPS"] = {}
+        if "device" in selected:
+            exif["0th"][271] = b""
+            exif["0th"][272] = b""
+            exif["0th"][0x000A] = b""
+        if "timestamps" in selected:
+            exif["0th"][306] = b""
+            exif["0th"][36867] = b""
+            exif["0th"][36868] = b""
+        if "owner" in selected:
+            exif["0th"][315] = b""
+            exif["0th"][33432] = b""
+        if "thumbnail" in selected:
+            exif["1st"] = {}
+        if "everything_else" in selected:
+            exif["0th"][305] = b""
+            exif["0th"][34665] = b""
+        if keep_authenticity_fields and 305 in exif["0th"]:
+            exif["0th"][305] = exif["0th"].get(305)
 
-            filtered = piexif.dump(exif)
-            processed_bytes = bytearray(file_bytes)
-            # Remove all EXIF data if any selected field is in use
-            if any(group in selected_fields for group in ["location", "device", "timestamps", "owner", "thumbnail", "everything_else", "authenticity"]):
-                try:
-                    new_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-                    buffer = io.BytesIO()
-                    new_image.save(buffer, format="JPEG", quality=95)
-                    processed_bytes = buffer.getvalue()
-                except Exception:
-                    pass
-                if image.format == "JPEG":
-                    exif_bytes = piexif.dump({"0th": {}, "GPS": {}, "Exif": {}, "1st": {}})
-                    # Replace by copying the image pixels without EXIF metadata.
-                    rgb = image.convert("RGB")
-                    buf = io.BytesIO()
-                    rgb.save(buf, format="JPEG", quality=95, exif=exif_bytes)
-                    processed_bytes = buf.getvalue()
+        rgb = image.convert("RGB")
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=95, exif=piexif.dump(exif))
+        processed = buffer.getvalue()
 
     elif image.format == "PNG":
-        if any(group in selected_fields for group in ["location", "device", "timestamps", "owner", "thumbnail", "everything_else", "authenticity"]):
+        if any(group in selected for group in ["location", "device", "timestamps", "owner", "thumbnail", "everything_else", "authenticity"]):
             rgb = image.convert("RGB")
-            buf = io.BytesIO()
-            rgb.save(buf, format="PNG")
-            processed_bytes = buf.getvalue()
+            buffer = io.BytesIO()
+            rgb.save(buffer, format="PNG")
+            processed = buffer.getvalue()
 
-    cleaned = extract_metadata(processed_bytes, file_name)
-    return processed_bytes, cleaned
+    cleaned = extract_metadata(processed, file_name)
+    return processed, cleaned
 
 
 def verify_cleanup(before: Dict[str, Any], after: Dict[str, Any], selection: List[str], keep_authenticity_fields: bool) -> List[Dict[str, Any]]:
@@ -326,19 +291,79 @@ def verify_cleanup(before: Dict[str, Any], after: Dict[str, Any], selection: Lis
     for key, label in fields.items():
         before_value = before.get(key)
         after_value = after.get(key)
-        if before_value in ({}, None, []) and after_value in ({}, None, []) and key not in selection:
+        if before_value in ({}, None, [], "") and after_value in ({}, None, [], "") and key not in selection:
             continue
 
         if key in selection or (key == "software" and keep_authenticity_fields):
-            status = "Removed" if (before_value not in ({}, None, [])) and (after_value in ({}, None, [])) else "Kept"
+            status = "Removed" if before_value not in ({}, None, []) and after_value in ({}, None, []) else "Kept"
         else:
             status = "Kept"
 
         rows.append({
             "field": label,
-            "before": str(before_value) if before_value not in ({}, None, []) else "Not present",
-            "after": str(after_value) if after_value not in ({}, None, []) else "Removed",
+            "before": "Not present" if before_value in ({}, None, []) else str(before_value),
+            "after": "Removed" if after_value in ({}, None, []) else str(after_value),
             "status": status,
         })
 
     return rows
+
+
+__all__ = [
+    "extract_metadata",
+    "apply_metadata_cleanup",
+    "verify_cleanup",
+]
+
+
+path = "";
+
+
+"""
+Legacy placeholder kept for compatibility.
+"""
+
+
+if __name__ == "__main__":
+    print("metadata utilities loaded")
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    """
+    """
+
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""

@@ -20,6 +20,7 @@
           <div class="section-header">
             <h2>Image</h2>
           </div>
+
           <div id="upload-box" class="upload-box" tabindex="0">
             <input id="file-input" type="file" accept="image/jpeg,image/png" />
             <label for="file-input">Choose image or drag here</label>
@@ -31,16 +32,20 @@
             <div id="overlay-layer" class="overlay-layer"></div>
           </div>
 
+          <div class="toggle-row overlay-toggle">
+            <label><input id="show-overlay" type="checkbox" checked /> Show face and plate overlay</label>
+          </div>
+
           <div id="analysis-status" class="analysis-status hidden">Analyzing...</div>
         </section>
 
         <section class="panel panel-right">
           <div class="report-box">
-            <div class="report-heading">
+            <div class="section-header">
               <h2>Privacy report</h2>
             </div>
             <div id="report-empty" class="empty-state">Upload a photo to begin the report.</div>
-            <div id="privacy-table" class="report-table hidden"></div>
+            <table id="report-table" class="report-table hidden"></table>
           </div>
 
           <div class="auth-box">
@@ -48,14 +53,27 @@
               <h2>Authenticity analysis</h2>
             </div>
             <div id="authenticity-panel" class="authenticity-panel hidden">
-              <div class="verdict-row">
-                <div id="verdict-text" class="verdict-text">Inconclusive</div>
-              </div>
-              <div class="confidence-row">
-                <div class="confidence-line"><span id="confidence-tick"></span></div>
-              </div>
+              <div class="verdict-row"><div id="verdict-text">Inconclusive</div></div>
+              <div class="confidence-row"><div class="confidence-line"><span id="confidence-tick"></span></div></div>
               <div class="confidence-label"><span id="confidence-value">0%</span> confidence</div>
               <ul id="reasons-list" class="reasons-list"></ul>
+              <div id="auth-note" class="auth-note"></div>
+            </div>
+          </div>
+
+          <div class="explain-box">
+            <div class="section-header">
+              <h2>Plain-language explanation</h2>
+            </div>
+            <div id="explanation-panel" class="explanation-panel hidden">
+              <div class="explanation-label">Margin note</div>
+              <div id="explanation-summary" class="explanation-summary"></div>
+              <ul id="explanation-risks" class="explanation-risks"></ul>
+              <ul id="explanation-next" class="explanation-next"></ul>
+            </div>
+            <div class="explain-actions">
+              <button id="explain-button" type="button" class="secondary-button">Explain these results</button>
+              <div class="helper-inline">Sends a text summary of the findings (not your image) to Google's Gemini API.</div>
             </div>
           </div>
 
@@ -73,7 +91,7 @@
                 <label><input type="checkbox" value="everything_else" checked /> Everything else</label>
               </div>
 
-              <label class="toggle-row"><input id="keep-authenticity" type="checkbox" checked /> Keep authenticity-related fields (software tag)</label>
+              <label class="toggle-row"><input id="keep-authenticity" type="checkbox" checked /> Keep authenticity-related fields</label>
 
               <div class="blur-row">
                 <label for="blur-mode">Blur mode</label>
@@ -93,17 +111,16 @@
             <div class="section-header">
               <h2>Verification</h2>
             </div>
-            <div id="verification-table" class="verification-table hidden"></div>
+            <table id="verification-table" class="verification-table hidden"></table>
           </div>
         </section>
       </main>
 
       <footer class="site-footer">
-        All uploads are processed locally and no filenames or image data are logged or sent anywhere.
+        Images are processed on this device and are not stored. If you use the explanation feature, a text summary of the findings, not your image, is sent to Google's Gemini API.
       </footer>
     </div>
 
     <script src="/static/app.js"></script>
   </body>
 </html>
-
