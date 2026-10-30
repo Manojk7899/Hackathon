@@ -1,126 +1,155 @@
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TruthVision Lens</title>
-    <link rel="stylesheet" href="/static/styles.css" />
-  </head>
-  <body>
-    <div class="page-shell">
-      <header class="topbar">
-        <div>
-          <h1>TruthVision Lens</h1>
-          <div class="tagline">Know what a photo is. Control what it reveals.</div>
-        </div>
-      </header>
+* {
+  box-sizing: border-box;
+}
 
-      <main class="main-layout">
-        <section class="panel panel-left">
-          <div class="section-header">
-            <h2>Image</h2>
-          </div>
+:root {
+  --paper: #F4F1EA;
+  --ink: #1B1B19;
+  --line: #c7c0b6;
+  --signal: #D9441F;
+}
 
-          <div id="upload-box" class="upload-box" tabindex="0">
-            <input id="file-input" type="file" accept="image/jpeg,image/png" />
-            <label for="file-input">Choose image or drag here</label>
-            <div class="helper">JPEG and PNG up to 15 MB</div>
-          </div>
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: system-ui, sans-serif;
+}
 
-          <div id="image-stage" class="image-stage hidden" aria-live="polite">
-            <img id="preview-image" alt="Uploaded preview" />
-            <div id="overlay-layer" class="overlay-layer"></div>
-          </div>
+.page-shell {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
 
-          <div class="toggle-row overlay-toggle">
-            <label><input id="show-overlay" type="checkbox" checked /> Show face and plate overlay</label>
-          </div>
+.topbar {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+  margin-bottom: 20px;
+}
 
-          <div id="analysis-status" class="analysis-status hidden">Analyzing...</div>
-        </section>
+h1 {
+  margin: 0;
+  font-family: Georgia, serif;
+}
 
-        <section class="panel panel-right">
-          <div class="report-box">
-            <div class="section-header">
-              <h2>Privacy report</h2>
-            </div>
-            <div id="report-empty" class="empty-state">Upload a photo to begin the report.</div>
-            <table id="report-table" class="report-table hidden"></table>
-          </div>
+.tagline {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
 
-          <div class="auth-box">
-            <div class="section-header">
-              <h2>Authenticity analysis</h2>
-            </div>
-            <div id="authenticity-panel" class="authenticity-panel hidden">
-              <div class="verdict-row"><div id="verdict-text">Inconclusive</div></div>
-              <div class="confidence-row"><div class="confidence-line"><span id="confidence-tick"></span></div></div>
-              <div class="confidence-label"><span id="confidence-value">0%</span> confidence</div>
-              <ul id="reasons-list" class="reasons-list"></ul>
-              <div id="auth-note" class="auth-note"></div>
-            </div>
-          </div>
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 20px;
+}
 
-          <div class="explain-box">
-            <div class="section-header">
-              <h2>Plain-language explanation</h2>
-            </div>
-            <div id="explanation-panel" class="explanation-panel hidden">
-              <div class="explanation-label">Margin note</div>
-              <div id="explanation-summary" class="explanation-summary"></div>
-              <ul id="explanation-risks" class="explanation-risks"></ul>
-              <ul id="explanation-next" class="explanation-next"></ul>
-            </div>
-            <div class="explain-actions">
-              <button id="explain-button" type="button" class="secondary-button">Explain these results</button>
-              <div class="helper-inline">Sends a text summary of the findings (not your image) to Google's Gemini API.</div>
-            </div>
-          </div>
+.panel {
+  border: 1px solid var(--line);
+  padding: 14px;
+  background: rgba(255,255,255,0.04);
+}
 
-          <div class="clean-box">
-            <div class="section-header">
-              <h2>Selective cleaning</h2>
-            </div>
-            <div id="clean-controls" class="clean-controls hidden">
-              <div class="checkbox-grid">
-                <label><input type="checkbox" value="location" checked /> Location</label>
-                <label><input type="checkbox" value="device" checked /> Device</label>
-                <label><input type="checkbox" value="timestamps" checked /> Timestamps</label>
-                <label><input type="checkbox" value="owner" checked /> Owner info</label>
-                <label><input type="checkbox" value="thumbnail" checked /> Thumbnail</label>
-                <label><input type="checkbox" value="everything_else" checked /> Everything else</label>
-              </div>
+.section-header {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  font-family: Georgia, serif;
+  font-weight: 700;
+}
 
-              <label class="toggle-row"><input id="keep-authenticity" type="checkbox" checked /> Keep authenticity-related fields</label>
+.upload-box {
+  border: 1px dashed var(--line);
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  background: #f5f2ee;
+}
 
-              <div class="blur-row">
-                <label for="blur-mode">Blur mode</label>
-                <select id="blur-mode">
-                  <option value="gaussian">Gaussian blur</option>
-                  <option value="pixelate">Pixelation</option>
-                </select>
-              </div>
+.upload-box input {
+  opacity: 0;
+  position: absolute;
+  inset: 0;
+}
 
-              <div class="button-row">
-                <button id="clean-button" class="primary-button" type="button">Clean &amp; download</button>
-              </div>
-            </div>
-          </div>
+.image-stage {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  min-height: 250px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
 
-          <div class="verification-box">
-            <div class="section-header">
-              <h2>Verification</h2>
-            </div>
-            <table id="verification-table" class="verification-table hidden"></table>
-          </div>
-        </section>
-      </main>
+img {
+  max-width: 100%;
+  max-height: 70vh;
+}
 
-      <footer class="site-footer">
-        Images are processed on this device and are not stored. If you use the explanation feature, a text summary of the findings, not your image, is sent to Google's Gemini API.
-      </footer>
-    </div>
+.hidden {
+  display: none !important;
+}
 
-    <script src="/static/app.js"></script>
-  </body>
-</html>
+.report-table, .verification-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.report-table th, .report-table td, .verification-table th, .verification-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 6px;
+  text-align: left;
+  font-family: ui-monospace, monospace;
+}
+
+.verdict {
+  font-size: 1.1rem;
+  font-family: Georgia, serif;
+  font-weight: 700;
+}
+
+.confidence-line {
+  height: 2px;
+  background: var(--line);
+  margin: 8px 0;
+}
+
+.confidence-line span {
+  display: block;
+  width: 50%;
+  height: 100%;
+  background: var(--signal);
+}
+
+.clean-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+button {
+  border: 1px solid var(--ink);
+  background: var(--signal);
+  color: white;
+  padding: 10px 14px;
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+.footer {
+  margin-top: 20px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
