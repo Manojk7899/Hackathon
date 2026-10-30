@@ -14,8 +14,8 @@
       </header>
 
       <main class="layout">
-        <section class="panel">
-          <div class="section-header">Upload</div>
+        <section class="panel left-panel">
+          <div class="section-head">Upload</div>
           <div id="upload-box" class="upload-box">
             <input id="file-input" type="file" accept="image/jpeg,image/png" />
             <label for="file-input">Choose image or drag here</label>
@@ -23,24 +23,24 @@
           </div>
 
           <div id="image-stage" class="image-stage hidden">
-            <img id="preview-image" alt="preview" />
+            <img id="preview-image" alt="Uploaded preview" />
           </div>
         </section>
 
-        <section class="panel">
-          <div class="section-header">Report</div>
+        <section class="panel right-panel">
+          <div class="section-head">Report</div>
           <div id="report-empty" class="empty-state">Upload a photo to begin the report.</div>
           <table id="report-table" class="report-table hidden"></table>
 
-          <div class="section-header">Authenticity</div>
+          <div class="section-head">Authenticity</div>
           <div id="auth-panel" class="auth-panel hidden">
             <div id="verdict-text" class="verdict"></div>
             <div class="confidence-line"><span id="confidence-tick"></span></div>
-            <div id="confidence-text"></div>
-            <ul id="reasons"></ul>
+            <div id="confidence-text" class="confidence-text"></div>
+            <ul id="reasons" class="reasons"></ul>
           </div>
 
-          <div class="section-header">Clean</div>
+          <div class="section-head">Clean</div>
           <div id="clean-box" class="clean-box hidden">
             <label><input type="checkbox" value="location" checked /> Location</label>
             <label><input type="checkbox" value="device" checked /> Device</label>
@@ -48,11 +48,23 @@
             <label><input type="checkbox" value="owner" checked /> Owner info</label>
             <label><input type="checkbox" value="thumbnail" checked /> Thumbnail</label>
             <label><input type="checkbox" value="everything_else" checked /> Everything else</label>
-            <button id="clean-button">Clean & download</button>
+            <label class="keep-row"><input type="checkbox" id="keep-authenticity" /> Keep authenticity metadata</label>
+            <div class="toolbar">
+              <button id="clean-button" class="primary">Clean and download</button>
+              <button id="explain-button" class="secondary" type="button">Explain these results</button>
+            </div>
+            <div class="explain-note">Sends a text summary of the findings (not your image) to Google's Gemini API.</div>
           </div>
 
-          <div class="section-header">Verification</div>
+          <div class="section-head">Verification</div>
           <table id="verification-table" class="verification-table hidden"></table>
+
+          <div id="explanation-block" class="explanation hidden">
+            <div class="explanation-label">MARGIN NOTE</div>
+            <div id="explanation-summary"></div>
+            <ul id="explanation-risks" class="mini-list"></ul>
+            <div class="explanation-source" id="explanation-source"></div>
+          </div>
         </section>
       </main>
 
